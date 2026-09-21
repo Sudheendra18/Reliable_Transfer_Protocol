@@ -1,14 +1,3 @@
-/*
-=====================================
-Mini Project 1 Submission
-Group Details:
-Member 1 Name: Harihara Varma
-Member 1 Roll number: 23CS10040
-Member 2 Name: Nymish Kumar Reddy
-Member 2 Roll number: 23CS10074
-=====================================
-*/
-
 #ifndef KSOCKET_H
 #define KSOCKET_H
 

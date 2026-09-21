@@ -1,15 +1,4 @@
 /*
-=====================================
-Mini Project 1 Submission
-Group Details:
-Member 1 Name: Harihara Varma
-Member 1 Roll number: 23CS10040
-Member 2 Name: Nymish Kumar Reddy
-Member 2 Roll number: 23CS10074
-=====================================
-*/
-
-/*
  * Packet format (PKT_LEN bytes total):
  *   [0..3]  type : "DATA", "ACK\0", "FIN\0", "FAK\0"
  *   [4..5]  seq  : big-endian uint16

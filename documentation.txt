@@ -1,12 +1,5 @@
 =====================================
-Mini Project 1 – Documentation
-CS39006: Networks Laboratory, Spring 2025-26
-=====================================
-Group Details:
-Member 1 Name: <Name>
-Member 1 Roll number: <Roll_Number>
-Member 2 Name: <Name>
-Member 2 Roll number: <Roll_Number>
+KTP: Reliable Transfer Protocol – Documentation
 =====================================
 
 
