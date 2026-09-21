@@ -5,48 +5,53 @@
 [![Networking: UDP](https://img.shields.io/badge/Networking-UDP%20%2F%20Sockets-2496ED)](https://en.wikipedia.org/wiki/User_Datagram_Protocol)
 [![Protocol: Sliding Window](https://img.shields.io/badge/Protocol-Sliding%20Window%20%2F%20ARQ-brightgreen)](https://en.wikipedia.org/wiki/Sliding_window_protocol)
 
-**KTP (Kernel-level/Custom Transport Protocol)** is a robust, reliable data transfer protocol engineered on top of unreliable UDP datagram sockets. It implements connection-oriented reliable transport features including **sliding window flow control**, **selective retransmission with wall-clock timeouts**, **in-order packet delivery**, **loss simulation**, and **graceful connection teardown (FIN/FAK)**.
+**KTP (Kernel-level Transport Protocol)** is a reliable, connection-oriented transport protocol built directly over standard UDP datagram sockets. It implements sliding window flow control, cumulative and selective acknowledgment, timeout-driven retransmission, and a graceful two-way connection termination handshake.
 
 ---
 
 ## 📑 Table of Contents
 
-- [Overview](#-overview)
-- [Architecture & Design](#-architecture--design)
+- [How KTP Works](#-how-ktp-works)
+- [Protocol Architecture](#-protocol-architecture)
   - [Shared Memory IPC](#1-shared-memory-ipc)
   - [Concurrency & Synchronization](#2-concurrency--synchronization)
-  - [The `initk` Multi-Threaded Engine](#3-the-initk-multi-threaded-engine)
-- [Packet Format](#-packet-format)
+  - [The Background Daemon (`initk`)](#3-the-background-daemon-initk)
+- [Step-by-Step: What Happens During Execution](#-step-by-step-what-happens-during-execution)
+  - [1. Socket Creation (`k_socket`)](#1-socket-creation-k_socket)
+  - [2. Binding Endpoints (`k_bind`)](#2-binding-endpoints-k_bind)
+  - [3. Sending Data (`k_sendto`)](#3-sending-data-k_sendto)
+  - [4. Packet Transmission & Retransmission (`threadS`)](#4-packet-transmission--retransmission-threads)
+  - [5. Packet Arrival & ACK Handling (`threadR`)](#5-packet-arrival--ack-handling-threadr)
+  - [6. Receiving Data (`k_recvfrom`)](#6-receiving-data-k_recvfrom)
+  - [7. Connection Teardown (`k_close`)](#7-connection-teardown-k_close)
+- [Sliding Window: Mathematical Foundation](#-sliding-window-mathematical-foundation)
+  - [Sequence Number Space](#sequence-number-space)
+  - [Window Size Constraint](#window-size-constraint)
+  - [Window Advancement Rules](#window-advancement-rules)
+- [Packet Format Specification](#-packet-format-specification)
 - [API Reference](#-api-reference)
-- [Sliding Window & Flow Control](#-sliding-window--flow-control)
-- [Loss Simulation & Empirical Performance](#-loss-simulation--empirical-performance)
-- [Project Structure](#-project-structure)
-- [Build & Compilation](#-build--compilation)
-- [Usage Guide & Demo](#-usage-guide--demo)
-  - [1. Launch the Protocol Engine](#step-1-start-the-protocol-engine)
-  - [2. Start the Receiver](#step-2-start-the-receiver-user2)
-  - [3. Start the Sender](#step-3-start-the-sender-user1)
-  - [4. Verify Integrity](#step-4-verify-data-integrity)
+- [Performance under Loss Simulation](#-performance-under-loss-simulation)
+- [Build & Execution](#-build--execution)
 
 ---
 
-## 💡 Overview
+## 💡 How KTP Works
 
-Standard UDP is fast but unreliable: datagrams can be dropped, duplicated, delayed, or delivered out of order. KTP bridges this gap by wrapping raw UDP sockets inside a custom protocol layer that guarantees:
+Standard UDP sockets provide an unreliable, connectionless datagram service where packets can be lost, duplicated, delayed, or reordered. KTP transforms raw UDP into a reliable byte-stream channel by maintaining state machines, sliding windows, and retransmission timers in shared memory:
 
-* **Guaranteed In-Order Delivery**: Application reads byte streams sequentially without gaps.
-* **Flow Control**: Dynamic receiver advertised window (`rwnd`) prevents the sender from overwhelming the receiver's buffers.
-* **Loss Recovery**: Per-packet timeout tracking and automatic retransmission of unacknowledged packets.
-* **Process Independence**: Socket tables live in POSIX shared memory, decoupled from user processes.
-* **Connection Lifecycle**: Clean connection teardown using a two-way `FIN` / `FAK` handshake.
+1. **State Independence**: The protocol state machine runs in a dedicated background daemon (`initk`) using POSIX shared memory. User processes interact with sockets through lightweight API wrappers (`k_socket`, `k_bind`, `k_sendto`, `k_recvfrom`, `k_close`).
+2. **Buffering**: Circular buffers decouple application write/read speeds from wire transmission speeds.
+3. **Flow Control**: Every acknowledgment carries an advertised window (`rwnd.avail`) indicating remaining buffer capacity at the receiver, preventing buffer overflow.
+4. **Reliability (ARQ)**: Unacknowledged packets are monitored with wall-clock expiration timers. If an ACK does not arrive within timeout period $T$, the sender retransmits the expired frames.
+5. **Ordered Delivery**: Out-of-order packets arriving within the receive window are buffered, but only delivered to the application in strict contiguous sequence order.
 
 ---
 
-## 🏛️ Architecture & Design
+## 🏛️ Protocol Architecture
 
 ```
 +-------------------------------------------------------------+
-|                      User Space Apps                        |
+|                      User Applications                      |
 |   +--------------------+              +-----------------+   |
 |   |  user1.c (Sender)  |              | user2.c (Recv)  |   |
 |   +---------+----------+              +--------+--------+   |
@@ -56,10 +61,10 @@ Standard UDP is fast but unreliable: datagrams can be dropped, duplicated, delay
               v                                  v
 +-------------------------------------------------------------+
 |               POSIX Shared Memory (`ktp_sock[]`)            |
-|  - Circular Send Buffer (`sbuf`)                            |
-|  - Circular Receive Buffer (`rbuf`)                         |
-|  - Send & Receive Sliding Windows (`swnd`, `rwnd`)          |
-|  - Binary Semaphores for Per-Socket Mutual Exclusion        |
+|  - Circular Send Buffer (`sbuf[10][512]`)                   |
+|  - Circular Receive Buffer (`rbuf[10][512]`)                |
+|  - Sliding Window Structures (`swnd`, `rwnd`)               |
+|  - Per-Socket Binary Semaphores (Mutual Exclusion)          |
 +-------------------------------------------------------------+
               ^                                  ^
               | Read/Write State                 | Read/Write State
@@ -70,8 +75,8 @@ Standard UDP is fast but unreliable: datagrams can be dropped, duplicated, delay
 |   +-------------------+  +-------------------+  +-------+   |
 |   | threadR (Receiver)|  | threadS (Sender)  |  |threadG|   |
 |   | - select() on UDP |  | - Retransmission  |  |  (GC) |   |
-|   | - ACK generation  |  | - Timeout checks  |  |       |   |
-|   | - Window updates  |  | - Sends pending   |  |       |   |
+|   | - ACK generation  |  | - Timer checks    |  |       |   |
+|   | - Window updates  |  | - Wire dispatch   |  |       |   |
 |   +---------+---------+  +---------+---------+  +-------+   |
 +-------------|----------------------|------------------------+
               |                      |
@@ -82,35 +87,152 @@ Standard UDP is fast but unreliable: datagrams can be dropped, duplicated, delay
 ```
 
 ### 1. Shared Memory IPC
-KTP stores all socket entries (`ktp_sock`) in a shared memory segment identified via `ftok()`. Each entry contains:
-* Socket metadata (bound addresses, owner PID, underlying UDP file descriptor).
-* Circular buffers: `sbuf[N][512]` (send buffer) and `rbuf[N][512]` (receive buffer).
-* Sliding window state: `swnd` and `rwnd` tracking head indices, sequence numbers, and deadlines.
+A shared memory table holds up to `MAX_KTP_SOCKS` (10) socket descriptors (`ktp_sock`). Each descriptor encapsulates:
+* **Socket Metadata**: Local/peer addresses, owner PID, underlying UDP file descriptor.
+* **Send Buffer (`sbuf`)**: 10 slots of 512-byte message payloads.
+* **Receive Buffer (`rbuf`)**: 10 slots of 512-byte message payloads.
+* **Window Structures (`slide_win`)**: Head indices, sequence numbers, arrival flags, and retransmission deadlines.
 
 ### 2. Concurrency & Synchronization
-Access to shared memory slots is guarded by a set of System V binary semaphores (`sem_lock` / `sem_unlock`). Only one thread or process may inspect or mutate a socket's state at any given moment.
+System V binary semaphores enforce mutual exclusion per socket entry (`sem_lock` / `sem_unlock`). Whenever an application or daemon thread reads or mutates socket state, it holds the corresponding semaphore to eliminate race conditions.
 
-### 3. The `initk` Multi-Threaded Engine
-The protocol daemon (`initk`) spawns three cooperating threads:
-* **`threadR` (Receiver & ACK Handler)**:
-  * Uses `select()` to multiplex I/O across all active UDP sockets.
-  * On `DATA`: Validates sequence numbers, places payload into `rbuf`, slides the receive window, and transmits an `ACK` with the current advertised window size.
-  * On `ACK`: Slides the send window forward, frees acknowledged `sbuf` slots, and adjusts `swnd.avail`.
-  * On `FIN`: Emits `FAK` and marks the socket slot for reclamation.
-* **`threadS` (Sender & Retransmission Engine)**:
-  * Loops periodically every $T/2$ seconds.
-  * Re-transmits any unacknowledged frames whose retransmission deadline has expired.
-  * First-transmits new pending messages deposited into `sbuf` by `k_sendto()`.
-  * Orchestrates `FIN` retransmissions during socket close.
-* **`threadG` (Garbage Collector)**:
-  * Periodically verifies owner process existence via `kill(pid, 0)`.
-  * Closes orphaned sockets if an application crashes without calling `k_close()`.
+### 3. The Background Daemon (`initk`)
+The `initk` process runs three continuous threads:
+* **`threadR` (Receiver & ACK Handler)**: Uses `select()` with a 100ms timeout over all bound UDP descriptors to process inbound `DATA`, `ACK`, `FIN`, and `FAK` packets.
+* **`threadS` (Sender & Retransmission Engine)**: Runs periodic passes every $T/2$ seconds to transmit freshly queued messages and retransmit expired frames.
+* **`threadG` (Garbage Collector)**: Wakes every $T$ seconds and probes owner processes with `kill(pid, 0)`. If a process terminated without closing its socket, `threadG` initiates cleanup.
 
 ---
 
-## 📦 Packet Format
+## 🔄 Step-by-Step: What Happens During Execution
 
-Each packet sent over the wire is fixed at `PKT_LEN` (520 bytes):
+```
+Sender (user1)            Daemon (initk)              Receiver (user2)
+      |                         |                           |
+      |-- k_socket() ---------->| (Allocates SM slot)       |
+      |-- k_bind() ------------>| (Binds UDP socket)        |
+      |                         |                           |
+      |-- k_sendto(payload) --->| (Copies to sbuf, exp=-1)  |
+      |                         |                           |
+      |                   [threadS wakes]                   |
+      |                         |-- UDP DATA (seq=1) ------>| (threadR receives)
+      |                         |                           | (Stores in rbuf)
+      |                         |<-- UDP ACK (seq=1, win)---| (Slides rwnd)
+      |                   [threadR receives ACK]            |
+      |                   (Frees sbuf[1], slides swnd)      |
+      |                         |                           |
+      |                         |                           |-- k_recvfrom() -> read
+      |                         |                           | (Frees rbuf, opens win)
+      |                         |                           |
+      |-- k_close() ----------->| (Sets closed flag)        |
+      |                         |-- UDP FIN --------------->|
+      |                         |<-- UDP FAK ---------------|
+      |                         | (Releases SM slot)        |
+```
+
+### 1. Socket Creation (`k_socket`)
+* Attaches to the shared memory segment.
+* Scans the socket table for an unallocated entry (`free == true`).
+* Initializes `swnd` and `rwnd` with window size `WIN_SZ = 10` and initial sequence numbers $1 \dots 10$.
+* Marks the slot as occupied and records the caller's PID. Returns the slot index as the socket descriptor `ktp_fd`.
+
+### 2. Binding Endpoints (`k_bind`)
+* Writes the local IP/port and remote peer IP/port into the shared memory slot.
+* On the next cycle, `threadR` detects the pending binding, creates a real POSIX UDP socket (`AF_INET, SOCK_DGRAM`), binds it to the local port, and marks `bound = true`.
+
+### 3. Sending Data (`k_sendto`)
+* Validates that the destination address matches the bound peer.
+* Checks if `swnd.avail > 0` and an empty send buffer slot exists.
+* Copies up to 512 bytes into `sbuf[slot]`, marks `sbuf_empty[slot] = false`, and sets `expires[slot] = -1` (indicating pending initial transmission).
+* Decrements `swnd.avail`. Returns the number of bytes queued.
+
+### 4. Packet Transmission & Retransmission (`threadS`)
+* **Pass 1 (Expired Frames)**: Iterates over all active send buffer slots. If a slot has been sent (`expires > 0`) and the current wall-clock time exceeds `expires`, the packet has timed out. `threadS` retransmits the `DATA` packet over UDP and resets its deadline:
+  $$\text{expires} = \text{now} + T \quad (T = 5\text{s})$$
+* **Pass 2 (New Frames)**: Identifies slots with `expires == -1`. Constructs a `DATA` packet with the slot's assigned sequence number, sends it via `sendto()`, and sets its initial expiration timestamp to $\text{now} + T$.
+
+### 5. Packet Arrival & ACK Handling (`threadR`)
+When a UDP datagram arrives:
+* **`DATA` Packet**:
+  * If the sequence number falls within the current receive window and has not been seen before, the payload is written into `rbuf` and marked `got_pkt = true`.
+  * The receive window slides over all contiguous received messages.
+  * An `ACK` packet is returned containing:
+    * `seq`: The highest in-order sequence number acknowledged.
+    * `winsz`: The current available space in `rbuf` (`rwnd.avail`).
+  * If the packet is a duplicate (already received or outside the window), an immediate duplicate `ACK` is returned with the current `ack_seq` to accelerate sender synchronization.
+* **`ACK` Packet**:
+  * The sender locates the acknowledged sequence number in `swnd`.
+  * All buffer slots up to and including the acknowledged sequence number are freed (`sbuf_empty = true`, `expires = -1`).
+  * `swnd.head` advances past the acknowledged slots, and newly available sequence numbers are assigned.
+  * The sender updates its available window to the receiver's advertised window: `swnd.avail = winsz`.
+
+### 6. Receiving Data (`k_recvfrom`)
+* Checks if the slot at `rwnd.head` holds an in-order delivered message (`got_pkt == true`).
+* Copies the payload from `rbuf` to the user's buffer.
+* Clears `got_pkt[head]`, increments `rwnd.avail`, and advances `rwnd.head`.
+* If the receive buffer was previously full (`recv_full == true`), the opening of buffer space triggers a probe ACK from `threadR` to notify the sender that the window has reopened.
+
+### 7. Connection Teardown (`k_close`)
+* Sets `closed = true` in the socket slot.
+* `threadS` sends a `FIN` control packet to the peer and sets a retry timer.
+* Upon receiving `FIN`, the peer's `threadR` replies with `FAK` (FIN-ACK) and immediately frees its socket slot.
+* Upon receiving `FAK`, the initiator releases its shared memory slot and semaphore.
+
+---
+
+## 📐 Sliding Window: Mathematical Foundation
+
+The protocol uses a circular sequence number space to support continuous transmission without ambiguity.
+
+### Sequence Number Space
+Sequence numbers are represented using $k = 5$ bits:
+
+$$S = 2^k = 32$$
+
+The sequence numbers cycle through the range:
+
+$$1 \le \text{seq} \le 32$$
+
+When a slot advances, its next sequence number is computed as:
+
+$$\text{seq}_{\text{next}} = (\text{tail\_seq} \pmod S) + 1$$
+
+### Window Size Constraint
+In any sliding window protocol with selective buffering and cumulative acknowledgments, the sender window size $W_{\text{send}}$ and receiver window size $W_{\text{recv}}$ must satisfy:
+
+$$W_{\text{send}} + W_{\text{recv}} \le S$$
+
+For symmetric window configurations where $W_{\text{send}} = W_{\text{recv}} = W$:
+
+$$2W \le S \implies W \le \frac{S}{2}$$
+
+Substituting $S = 32$:
+
+$$W \le \frac{32}{2} = 16$$
+
+In KTP, the window size is configured as:
+
+$$W = \text{WIN\_SZ} = 10$$
+
+Since $10 \le 16$, the window configuration strictly satisfies the mathematical bound. This guarantees that:
+1. The receiver window never overlaps with sequence numbers of unacknowledged packets from the previous cycle.
+2. Delayed or duplicate packets from a previous window iteration cannot be misidentified as new data.
+
+### Window Advancement Rules
+
+* **Sender Window**:
+  $$\text{Active Window} = [V(A), V(A) + W_{\text{effective}} - 1] \pmod S$$
+  where $V(A)$ is the oldest unacknowledged sequence number, and $W_{\text{effective}} = \min(W, \text{advertised window})$.
+
+* **Receiver Window**:
+  $$\text{Acceptable Range} = [V(R), V(R) + W - 1] \pmod S$$
+  where $V(R)$ is the next expected in-order sequence number.
+
+---
+
+## 📦 Packet Format Specification
+
+All datagrams transmitted over the network have a fixed length of 520 bytes:
 
 ```
  0                   1                   2                   3
@@ -128,152 +250,106 @@ Each packet sent over the wire is fixed at `PKT_LEN` (520 bytes):
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
+| Field | Length | Description |
+|:------|:-------|:------------|
+| **Type** | 4 bytes | Identifies packet role: `DATA`, `ACK\0`, `FIN\0`, or `FAK\0`. |
+| **Sequence Number** | 2 bytes | 16-bit unsigned integer (big-endian). Identifies packet sequence or ACK reference. |
+| **Advertised Window Size** | 2 bytes | 16-bit unsigned integer (big-endian). Conveys available slots in receiver buffer. |
+| **Payload** | 512 bytes | Application data. Zeroed out for control packets (`ACK`, `FIN`, `FAK`). |
+
 ---
 
 ## 🔧 API Reference
 
-KTP provides an interface mimicking the standard POSIX Berkeley sockets API:
-
 ```c
 #include "ksocket.h"
 
-// 1. Create a KTP socket
+// Creates an unbound KTP socket; returns a non-negative socket descriptor on success
 ktp_fd k_socket(int domain, int type, int protocol);
 
-// 2. Bind local and destination endpoints
+// Associates the KTP socket with local and remote IP/port endpoints
 int k_bind(ktp_fd fd, const char *src_ip, int src_port, const char *dst_ip, int dst_port);
 
-// 3. Send message through the sliding window
+// Enqueues data into the send window for reliable transmission
 ssize_t k_sendto(ktp_fd fd, const void *buf, size_t len, int flags,
                  const struct sockaddr *dst, socklen_t dstlen);
 
-// 4. Retrieve in-order delivered message
+// Retrieves the next sequential, in-order message from the receive window
 ssize_t k_recvfrom(ktp_fd fd, void *buf, size_t len, int flags,
                    struct sockaddr *src, socklen_t *srclen);
 
-// 5. Gracefully close the socket (triggers FIN/FAK handshake)
+// Initiates graceful teardown with the remote peer via FIN/FAK handshake
 int k_close(ktp_fd fd);
 ```
 
 ---
 
-## 🔄 Sliding Window & Flow Control
+## 📊 Performance under Loss Simulation
 
-KTP maintains explicit sliding windows on both endpoints:
+The protocol incorporates an integrated packet drop simulator `sim_drop(p)` that drops packets with probability $p$ to evaluate recovery performance.
 
-* **Send Window (`swnd`)**:
-  * Tracks unacknowledged in-flight packets.
-  * Bounded by $\min(\text{WIN\_SZ}, \text{receiver advertised window})$.
-  * Advances when cumulative or selective ACKs arrive.
-* **Receive Window (`rwnd`)**:
-  * Accommodates out-of-order arrivals within the window boundary.
-  * Delivers packets to the user application strictly in order.
-  * Advertises `rwnd.avail` in every ACK packet.
-  * Handles zero-window conditions via probe ACKs once buffer space reopens.
+Empirical transfer results for a 100 KB payload (~200 messages of 512 bytes each) with timeout $T = 5\text{s}$:
 
----
+| Drop Probability (p) | Total Transmissions | Average Retransmissions per Message |
+|:--------------------:|:-------------------:|:-----------------------------------:|
+| 0.05                 | 211                 | 1.055                               |
+| 0.10                 | 224                 | 1.120                               |
+| 0.15                 | 239                 | 1.195                               |
+| 0.20                 | 258                 | 1.290                               |
+| 0.25                 | 278                 | 1.390                               |
+| 0.30                 | 304                 | 1.520                               |
+| 0.35                 | 336                 | 1.680                               |
+| 0.40                 | 381                 | 1.905                               |
+| 0.45                 | 447                 | 2.235                               |
+| 0.50                 | 548                 | 2.740                               |
 
-## 📊 Loss Simulation & Empirical Performance
+$$\text{Average Retransmissions} = \frac{\text{Total Transmissions}}{\text{Total Messages}}$$
 
-The protocol includes a probabilistic packet drop simulator `sim_drop(p)` to test reliability over lossy links.
-
-Empirical evaluation transmitting a 100 KB test payload (~200 messages of 512 bytes) with timeout $T = 5\text{s}$:
-
-| Drop Probability ($p$) | Total Transmissions | Avg Retransmissions / Msg |
-|:----------------------:|:-------------------:|:-------------------------:|
-| **0.05**               | 211                 | 1.055                     |
-| **0.10**               | 224                 | 1.120                     |
-| **0.15**               | 239                 | 1.195                     |
-| **0.20**               | 258                 | 1.290                     |
-| **0.25**               | 278                 | 1.390                     |
-| **0.30**               | 304                 | 1.520                     |
-| **0.35**               | 336                 | 1.680                     |
-| **0.40**               | 381                 | 1.905                     |
-| **0.45**               | 447                 | 2.235                     |
-| **0.50**               | 548                 | 2.740                     |
-
-> **Note**: Retransmissions scale super-linearly beyond $p = 0.35$ due to cascade timeout events on dropped ACKs and retransmissions.
+Beyond $p = 0.35$, retransmissions scale super-linearly as dropped ACKs trigger cascading window timeouts and redundant frame transmissions.
 
 ---
 
-## 📁 Project Structure
+## 🛠️ Build & Execution
 
-```
-.
-├── initksocket.c      # Protocol daemon (threadR, threadS, threadG, IPC management)
-├── ksocket.c          # Core socket API implementation (k_socket, k_bind, k_sendto, etc.)
-├── ksocket.h          # Data structures, packet layout, and API function prototypes
-├── user1.c            # Test sender application (reads input.txt and transmits over KTP)
-├── user2.c            # Test receiver application (receives KTP stream and writes to disk)
-├── input.txt          # Sample payload file for file transfer testing
-├── documentation.txt  # Detailed protocol specifications & test data
-├── makefile           # Build scripts for static library, daemon, and test binaries
-└── README.md          # Project documentation
-```
+### Prerequisites
+* GCC compiler
+* POSIX-compliant environment (Linux / WSL)
+* `pthread` support
 
----
-
-## 🛠️ Build & Compilation
-
-### Requirements
-* GCC Compiler (`gcc`)
-* POSIX compliant OS (Linux / WSL)
-* POSIX Threads (`-lpthread`)
-* System V IPC support (`sys/ipc.h`, `sys/shm.h`, `sys/sem.h`)
-
-### Build Targets
+### Compilation
 
 ```bash
-# Build the static library (libksocket.a)
+# Build static library (libksocket.a)
 make
 
-# Build the protocol daemon (initk)
+# Build background protocol daemon (initk)
 make init
 
-# Build the sender (u1) and receiver (u2) test applications
+# Build sender (u1) and receiver (u2) binaries
 make user
-
-# Clean build artifacts
-make clean
-
-# Deep clean (removes static library as well)
-make deepclean
 ```
 
----
+### Running the System
 
-## 🚀 Usage Guide & Demo
+Open three terminal sessions:
 
-Open three terminal windows (or tabs) on your Linux/WSL environment:
+1. **Terminal 1 — Protocol Daemon**:
+   ```bash
+   ./initk
+   ```
 
-### Step 1: Start the Protocol Engine
-In **Terminal 1**, start the background daemon:
-```bash
-./initk
-```
-*This initializes the shared memory segment, sets up semaphores, and starts the receiver, sender, and GC threads.*
+2. **Terminal 2 — Receiver Application**:
+   ```bash
+   ./u2 127.0.0.1 8002 127.0.0.1 8001
+   ```
 
-### Step 2: Start the Receiver (`user2`)
-In **Terminal 2**, start the receiver listening on port `8002` from sender at `8001`:
-```bash
-./u2 127.0.0.1 8002 127.0.0.1 8001
-```
+3. **Terminal 3 — Sender Application**:
+   ```bash
+   ./u1 127.0.0.1 8001 127.0.0.1 8002
+   ```
 
-### Step 3: Start the Sender (`user1`)
-In **Terminal 3**, launch the sender transmitting `input.txt`:
-```bash
-./u1 127.0.0.1 8001 127.0.0.1 8002
-```
-
-### Step 4: Verify Data Integrity
-Once the transfer completes and `user1` reaches End-of-Stream (`EOS`), verify that the received file matches the input:
-```bash
-diff -s input.txt received_8002.txt
-# Output: Files input.txt and received_8002.txt are identical
-```
-
----
-
-## 📜 License
-
-This project is open source and available under the [MIT License](LICENSE).
+4. **Verify Transmission**:
+   ```bash
+   diff -s input.txt received_8002.txt
+   # Output: Files input.txt and received_8002.txt are identical
+   ```
