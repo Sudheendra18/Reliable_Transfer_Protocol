@@ -195,7 +195,9 @@ $$1 \le \text{seq} \le 32$$
 
 When a slot advances, its next sequence number is computed as:
 
-$$\text{seq}_{\text{next}} = (\text{tail\_seq} \pmod S) + 1$$
+$$\text{seq}_{\text{next}} = (\text{tailSeq} \bmod S) + 1$$
+
+where `tailSeq` (in code: `tail_seq`) tracks the last assigned sequence number.
 
 ### Window Size Constraint
 In any sliding window protocol with selective buffering and cumulative acknowledgments, the sender window size $W_{\text{send}}$ and receiver window size $W_{\text{recv}}$ must satisfy:
@@ -210,23 +212,23 @@ Substituting $S = 32$:
 
 $$W \le \frac{32}{2} = 16$$
 
-In KTP, the window size is configured as:
+In KTP, the window size `WIN_SZ` is configured as:
 
-$$W = \text{WIN\_SZ} = 10$$
+$$W = 10$$
 
-Since $10 \le 16$, the window configuration strictly satisfies the mathematical bound. This guarantees that:
+Since $W = 10 \le 16$, the window configuration strictly satisfies the mathematical bound. This guarantees that:
 1. The receiver window never overlaps with sequence numbers of unacknowledged packets from the previous cycle.
 2. Delayed or duplicate packets from a previous window iteration cannot be misidentified as new data.
 
 ### Window Advancement Rules
 
 * **Sender Window**:
-  $$\text{Active Window} = [V(A), V(A) + W_{\text{effective}} - 1] \pmod S$$
-  where $V(A)$ is the oldest unacknowledged sequence number, and $W_{\text{effective}} = \min(W, \text{advertised window})$.
+  $$[V_A, \; V_A + W_{\text{eff}} - 1] \pmod S$$
+  where $V_A$ is the oldest unacknowledged sequence number, and $W_{\text{eff}} = \min(W, \text{advertised window})$.
 
 * **Receiver Window**:
-  $$\text{Acceptable Range} = [V(R), V(R) + W - 1] \pmod S$$
-  where $V(R)$ is the next expected in-order sequence number.
+  $$[V_R, \; V_R + W - 1] \pmod S$$
+  where $V_R$ is the next expected in-order sequence number.
 
 ---
 
