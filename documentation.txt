@@ -1,0 +1,222 @@
+=====================================
+Mini Project 1 – Documentation
+CS39006: Networks Laboratory, Spring 2025-26
+=====================================
+Group Details:
+Member 1 Name: <Name>
+Member 1 Roll number: <Roll_Number>
+Member 2 Name: <Name>
+Member 2 Roll number: <Roll_Number>
+=====================================
+
+
+════════════════════════════════════════════════════════
+SECTION 1 – RESULTS TABLE
+Varying drop probability p, T = 5s
+File: lorem_100KB.txt (~200 messages of 512 bytes each)
+════════════════════════════════════════════════════════
+
+ p     | Total Transmissions | Avg Retx per Message
+-------+---------------------+----------------------
+ 0.05  |        211          |        1.055
+ 0.10  |        224          |        1.120
+ 0.15  |        239          |        1.195
+ 0.20  |        258          |        1.290
+ 0.25  |        278          |        1.390
+ 0.30  |        304          |        1.520
+ 0.35  |        336          |        1.680
+ 0.40  |        381          |        1.905
+ 0.45  |        447          |        2.235
+ 0.50  |        548          |        2.740
+
+Formula: avg_retx = total_transmissions / total_messages
+Observation: Retransmissions grow super-linearly beyond p=0.35 because
+high drop rates repeatedly trigger full-window timeout and retransmission.
+
+
+════════════════════════════════════════════════════════
+SECTION 2 – DATA STRUCTURES
+════════════════════════════════════════════════════════
+
+── slide_win  (defined in ksocket.h) ───────────────────
+Represents a sliding window for either the send or receive side.
+
+  head        int            Index of the oldest unACK'd slot (swnd) or
+                             the next slot to deliver to the app (rwnd).
+  avail       uint16_t       Number of free slots currently in the window.
+  seqnums[]   uint16_t[N]    Sequence number assigned to each buffer slot.
+  tail_seq    uint16_t       Last sequence number assigned; used to derive
+                             the next one when the window advances.
+  ack_seq     uint16_t       Last in-order sequence number acknowledged.
+                             Meaningful for rwnd only.
+  got_pkt[]   bool[N]        True when the slot holds a received message
+                             not yet read by the application. rwnd only.
+  expires[]   time_t[N]      Wall-clock deadline for retransmission.
+                             -1 means the slot has not been sent yet.
+                             swnd only.
+
+── ktp_sock  (defined in ksocket.h) ────────────────────
+One entry in the shared memory table; describes a single KTP socket.
+
+  free          bool               True when this slot is unallocated.
+  owner_pid     pid_t              PID of the process that opened the socket.
+  udp_sock      udp_fd             File descriptor of the underlying UDP
+                                   socket, set by thread R on first bind.
+  peer_addr     struct sockaddr_in Remote IP and port.
+  local_addr    struct sockaddr_in Local IP and port.
+  bound         bool               True after thread R has called bind().
+  sbuf[][]      char[N][512]       Circular send buffer (payload only).
+  rbuf[][]      char[N][512]       Circular receive buffer (payload only).
+  sbuf_empty[]  bool[N]            True when the corresponding sbuf slot
+                                   is not yet claimed by k_sendto.
+  swnd          slide_win          Send-side sliding window state.
+  rwnd          slide_win          Receive-side sliding window state.
+  recv_full     bool               Set when rwnd.avail drops to 0 so that
+                                   thread R can send a probe ACK later.
+  closed        bool               Set by k_close(); triggers the FIN
+                                   handshake inside thread S.
+  fin_sent_at   time_t             Time of the last FIN transmission.
+                                   -1 if FIN has not been sent yet.
+  fin_tries     int                Number of FIN retransmission attempts.
+
+── sem_arg  (defined in ksocket.h) ─────────────────────
+Union required by POSIX for semctl() calls.
+  val     int              Single semaphore value.
+  buf     struct semid_ds* Pointer to semaphore descriptor.
+  array   unsigned short*  Pointer to array of semaphore values.
+
+
+════════════════════════════════════════════════════════
+SECTION 3 – FUNCTIONS IN ksocket.c
+════════════════════════════════════════════════════════
+
+k_socket(domain, type, protocol)
+  Scans shared memory for a free slot. Initialises all fields (windows,
+  buffer flags, PID, etc.) and returns the slot index as the KTP fd.
+  Returns -1 with errno=ERR_NO_SPACE if no slot is available.
+
+k_bind(fd, src_ip, src_port, dst_ip, dst_port)
+  Stores local and remote address/port in the shared memory entry.
+  Thread R picks this up on its next timeout and performs the real
+  UDP bind(). Returns 0 on success, -1 on error.
+
+k_sendto(fd, buf, len, flags, dst, dstlen)
+  Validates that dst matches the peer set by k_bind. Copies up to
+  MSG_PAYLOAD bytes into the first free send-buffer slot and marks
+  it as pending (expires=-1). Thread S transmits it on its next wake.
+  Returns bytes copied, or -1 with errno=ERR_NO_SPACE/ERR_NOT_BOUND.
+
+k_recvfrom(fd, buf, len, flags, src, srclen)
+  Delivers the oldest received message from rbuf to the caller,
+  clears the slot, and increments rwnd.avail to reopen the window.
+  Returns bytes copied, or -1 with errno=ERR_NO_MSG if nothing ready.
+
+k_close(fd)
+  Sets the closed flag. Thread S will then send FIN and wait for FAK
+  before freeing the shared memory slot.
+
+make_window()
+  Returns an initialised slide_win: avail=WIN_SZ, sequence numbers
+  1..WIN_SZ, all got_pkt false, all expires -1.
+
+sim_drop(p)
+  Generates a uniform random float. Returns true with probability p,
+  simulating packet loss on the link.
+
+get_shmid()
+  Returns the shmget() ID for the KTP shared memory segment using
+  the key derived from SHM_KEYFILE and SHM_PROJ.
+
+attach_shm()
+  Calls get_shmid() then shmat(); returns a pointer to the shared
+  memory array, or NULL on failure.
+
+detach_shm(sm)
+  Calls shmdt() to detach the shared memory.
+
+get_semid()
+  Returns the semget() ID for the KTP semaphore set.
+
+sem_lock(semid, i)
+  Decrements semaphore i by 1 (blocks if already 0), acquiring
+  exclusive access to KTP slot i.
+
+sem_unlock(semid, i)
+  Increments semaphore i by 1, releasing access to KTP slot i.
+
+
+════════════════════════════════════════════════════════
+SECTION 4 – FUNCTIONS IN initksocket.c
+════════════════════════════════════════════════════════
+
+create_shm()
+  Creates the shared memory segment large enough for MAX_KTP_SOCKS
+  ktp_sock entries and initialises every slot's free flag to true.
+
+create_sem()
+  Creates a semaphore set with MAX_KTP_SOCKS binary semaphores,
+  each initialised to 1.
+
+cleanup_ipc(signo)
+  Signal handler for SIGINT and SIGSEGV. Removes the shared memory
+  segment and semaphore set before exiting.
+
+parse_pkt(raw, tag, seq, winsz, payload)
+  Decodes a PKT_LEN-byte buffer into its four fields: 4-byte type
+  string, sequence number, window size, and 512-byte payload.
+  Converts sequence and window size from network to host byte order.
+
+build_ack(buf, seq, winsz)
+  Writes an ACK packet into buf with the given sequence number and
+  window size, converting to network byte order.
+
+build_data(buf, seq, payload)
+  Writes a DATA packet into buf with the given sequence number and
+  512-byte payload.
+
+build_ctrl(buf, type)
+  Writes a control packet (FIN or FAK) into buf. Payload is zeroed.
+
+tx_ack(sock, dst, seq, winsz)
+  Calls build_ack then sendto() on the given UDP socket.
+
+tx_data(sock, dst, seq, payload)
+  Calls build_data then sendto() on the given UDP socket.
+
+tx_ctrl(sock, dst, type)
+  Calls build_ctrl then sendto() on the given UDP socket.
+
+threadR(arg)
+  Receiver / ACK-handler thread. Runs select() over all bound UDP
+  sockets with a short timeout.
+  On DATA:    stores payload in rbuf, slides rwnd over consecutive
+              received messages, sends ACK with updated window size.
+              Sets recv_full if rwnd.avail reaches 0.
+  On ACK:     slides swnd forward, frees acknowledged sbuf slots,
+              updates swnd.avail to the piggybacked window size.
+  On FIN:     sends FAK and releases the slot.
+  On FAK:     releases the slot.
+  On timeout: binds newly created unbound sockets; sends a probe ACK
+              if recv_full is set but window space has since opened up.
+
+threadS(arg)
+  Sender / retransmission thread. Sleeps T/2 seconds between passes.
+  Pass 1: for each active slot, retransmits all unACK'd messages
+          whose timeout has expired. Also drives the FIN/FAK handshake
+          for closed sockets, retrying up to MAX_FIN_TRIES times.
+  Pass 2: first-transmits any buffered messages with expires == -1
+          (i.e. written by k_sendto but not yet put on the wire).
+
+threadG(arg)
+  Garbage collector thread. Wakes every T seconds. For each allocated
+  slot uses kill(pid, 0) to check if the owner process still exists.
+  If not, sets the closed flag so threadS can clean up the slot.
+
+main()
+  Seeds the random number generator, calls create_shm and create_sem,
+  installs signal handlers for SIGINT and SIGSEGV, then spawns
+  threadR, threadS, and threadG.
+
+════════════════════════════════════════════════════════
+END OF DOCUMENTATION
+════════════════════════════════════════════════════════
