@@ -1,4 +1,4 @@
-# 🚀 KTP: Reliable Transfer Protocol over UDP
+Reliable Transfer Protocol over UDP
 
 [![Language: C](https://img.shields.io/badge/Language-C-00599C?logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C_(programming_language))
 [![Platform: POSIX / Linux](https://img.shields.io/badge/Platform-POSIX%20%2F%20Linux-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
